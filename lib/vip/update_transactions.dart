@@ -1,3 +1,4 @@
+
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
@@ -11,15 +12,14 @@ class VipUpdateTransactionScreen extends StatefulWidget {
       _VipUpdateTransactionScreenState();
 }
 
-class _VipUpdateTransactionScreenState
-    extends State<VipUpdateTransactionScreen> {
+class _VipUpdateTransactionScreenState extends State<VipUpdateTransactionScreen> {
   final supabase = Supabase.instance.client;
   final _traysController = TextEditingController();
   final _paidController = TextEditingController();
   List<Map<String, dynamic>> users = [];
   List<Map<String, dynamic>> transactions = [];
   String? selectedUserId;
-  String? editingTransactionId; // Changed from int? to String?
+  String? editingTransactionId;
   DateTime? startDate;
   DateTime? endDate;
   String? selectedModeOfPayment;
@@ -38,6 +38,7 @@ class _VipUpdateTransactionScreenState
     _fetchTransactions();
     _fetchEggRate();
     _traysController.addListener(_calculateCredit);
+    _setupRealtimeSubscription();
   }
 
   Future<void> _fetchUsers() async {
@@ -54,30 +55,13 @@ class _VipUpdateTransactionScreenState
         users = List<Map<String, dynamic>>.from(response);
         isLoadingUsers = false;
       });
-    } on PostgrestException catch (e) {
-      String message;
-      if (e.code == '42P01') {
-        message =
-            'Table "wholesale_users" does not exist. Verify Supabase schema.';
-      } else if (e.code == '42501') {
-        message =
-            'Permission denied for "wholesale_users". Check RLS policies.';
-      } else {
-        message = 'Error fetching users: ${e.message} (Code: ${e.code})';
-      }
+    } catch (e) {
       setState(() {
-        errorMessage = message;
+        errorMessage = 'Error fetching users: $e';
         isLoadingUsers = false;
       });
       ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text(message)));
-    } catch (e) {
-      setState(() {
-        errorMessage = 'Unexpected error fetching users: $e';
-        isLoadingUsers = false;
-      });
-      ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Unexpected error fetching users: $e')));
+          .showSnackBar(SnackBar(content: Text('Error fetching users: $e')));
     }
   }
 
@@ -98,32 +82,15 @@ class _VipUpdateTransactionScreenState
           errorMessage = 'No egg rate found, using default rate ₹10.0';
         });
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-              content: Text('No egg rate found, using default rate ₹10.0')),
+          const SnackBar(content: Text('No egg rate found, using default rate ₹10.0')),
         );
       }
-    } on PostgrestException catch (e) {
-      String message;
-      if (e.code == '42P01') {
-        message =
-            'Table "wholesale_eggrate" does not exist. Verify Supabase schema.';
-      } else if (e.code == '42501') {
-        message =
-            'Permission denied for "wholesale_eggrate". Check RLS policies.';
-      } else {
-        message = 'Error fetching egg rate: ${e.message} (Code: ${e.code})';
-      }
-      setState(() {
-        errorMessage = message;
-      });
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text(message)));
     } catch (e) {
       setState(() {
-        errorMessage = 'Unexpected error fetching egg rate: $e';
+        errorMessage = 'Error fetching egg rate: $e';
       });
-      ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Unexpected error fetching egg rate: $e')));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('Error fetching egg rate: $e')));
     }
   }
 
@@ -150,7 +117,6 @@ class _VipUpdateTransactionScreenState
       var query = supabase.from('wholesale_transaction').select(
           'id, user_id, date, credit, paid, balance, mode_of_payment, wholesale_users!inner(full_name)');
 
-      // Apply filters
       if (selectedUserId != null && selectedUserId!.isNotEmpty) {
         query = query.eq('user_id', selectedUserId!);
       }
@@ -162,52 +128,87 @@ class _VipUpdateTransactionScreenState
       }
       if (selectedModeOfPayment != null && selectedModeOfPayment != 'All') {
         if (selectedModeOfPayment == 'None') {
-          query = query.isFilter('mode_of_payment', null);
+          query = query.filter('mode_of_payment', 'is', null);
         } else {
           query = query.eq('mode_of_payment', selectedModeOfPayment!);
         }
       }
 
-      // Apply sorting
-      final response = await query.order('date', ascending: sortAscending);
+      final response = await query.order('date', ascending: true); // Chronological order
+
+      // Process transactions to calculate running credit balance
+      final processedTransactions = <Map<String, dynamic>>[];
+      final userRunningBalance = <String, double>{}; // Tracks running balance
+
+      for (var transaction in List<Map<String, dynamic>>.from(response)) {
+        final userId = transaction['user_id'].toString();
+        final credit = (transaction['credit'] as num? ?? 0.0).toDouble();
+        final paid = (transaction['paid'] as num? ?? 0.0).toDouble();
+
+        // Initialize running balance for the user if not exists
+        userRunningBalance[userId] = userRunningBalance[userId] ?? 0.0;
+
+        // Calculate running credit: previous balance + current credit
+        final runningCredit = userRunningBalance[userId]! + credit;
+
+        // Calculate balance: running credit - paid
+        final balance = runningCredit - paid;
+
+        // Store transaction with running credit and balance
+        processedTransactions.add({
+          ...transaction,
+          'running_credit': runningCredit,
+          'balance': balance,
+        });
+
+        // Update running balance for next transaction
+        userRunningBalance[userId] = balance;
+      }
+
+      // Sort transactions based on sortAscending
+      processedTransactions.sort((a, b) => sortAscending
+          ? DateTime.parse(a['date']).compareTo(DateTime.parse(b['date']))
+          : DateTime.parse(b['date']).compareTo(DateTime.parse(a['date'])));
 
       setState(() {
-        transactions = List<Map<String, dynamic>>.from(response);
+        transactions = processedTransactions;
         isLoadingTransactions = false;
       });
-    } on PostgrestException catch (e) {
-      String message;
-      if (e.code == '42P01') {
-        message =
-            'Table "wholesale_transaction" does not exist. Verify schema.';
-      } else if (e.code == '42501') {
-        message = 'Permission denied for "wholesale_transaction". Check RLS.';
-      } else {
-        message = 'Error fetching transactions: ${e.message} (Code: ${e.code})';
-      }
-      setState(() {
-        errorMessage = message;
-        isLoadingTransactions = false;
-      });
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text(message)));
-      print(
-          'PostgrestException in _fetchTransactions: $e, Details: ${e.details}');
-    } on FormatException catch (e) {
-      setState(() {
-        errorMessage = 'Invalid user ID format: $e';
-        isLoadingTransactions = false;
-      });
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('Invalid user ID format: $e')));
     } catch (e) {
       setState(() {
-        errorMessage = 'Unexpected error fetching transactions: $e';
+        errorMessage = 'Error fetching transactions: $e';
         isLoadingTransactions = false;
       });
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text('Unexpected error fetching transactions: $e')));
-      print('Unexpected error in _fetchTransactions: $e');
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('Error fetching transactions: $e')));
+    }
+  }
+
+  void _setupRealtimeSubscription() {
+    try {
+      supabase
+          .channel('wholesale_transactions')
+          .onPostgresChanges(
+            event: PostgresChangeEvent.all,
+            schema: 'public',
+            table: 'wholesale_transaction',
+            callback: (payload) {
+              _fetchTransactions();
+            },
+          )
+          .subscribe((status, [error]) {
+        if (error != null) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Realtime subscription failed: $error')),
+          );
+        }
+      });
+    } catch (e) {
+      setState(() {
+        errorMessage = 'Failed to set up realtime updates: $e';
+      });
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('Failed to set up realtime updates: $e')));
     }
   }
 
@@ -220,24 +221,67 @@ class _VipUpdateTransactionScreenState
       if (selectedUserId == null) {
         throw Exception('Please select a user');
       }
+
+      // Initialize transaction data
+      double credit = 0.0;
+      double paid = 0.0;
+      String? modeOfPayment;
+      int? trays;
+
+      // Handle credit (trays)
       final traysText = _traysController.text.trim();
-      final trays = int.tryParse(traysText);
-      if (trays == null || trays <= 0) {
-        throw Exception('Please enter a valid number of trays');
+      if (traysText.isNotEmpty) {
+        trays = int.tryParse(traysText);
+        if (trays == null || trays <= 0) {
+          throw Exception('Please enter a valid number of trays');
+        }
+        credit = (eggRate * 30) * trays;
       }
-      final credit = (eggRate * 30) * trays;
-      final paid = double.tryParse(_paidController.text) ?? 0.0;
-      final modeOfPayment = selectedPaymentMode;
+
+      // Handle payment (paid and mode)
+      final paidText = _paidController.text.trim();
+      if (paidText.isNotEmpty) {
+        paid = double.tryParse(paidText) ?? 0.0;
+        if (paid < 0) {
+          throw Exception('Paid amount cannot be negative');
+        }
+        if (selectedPaymentMode == null) {
+          throw Exception('Please select a payment mode for paid amount');
+        }
+        modeOfPayment = selectedPaymentMode;
+      } else if (selectedPaymentMode != null) {
+        throw Exception('Please enter a paid amount for the selected payment mode');
+      }
+
+      // Require at least one of credit or paid
+      if (credit == 0 && paid == 0) {
+        throw Exception('Please enter either trays or paid amount');
+      }
+
+      // Fetch the latest transaction to get the previous balance
+      final latestTransaction = await supabase
+          .from('wholesale_transaction')
+          .select('balance')
+          .eq('user_id', selectedUserId!)
+          .order('date', ascending: false)
+          .limit(1)
+          .maybeSingle();
+
+      double previousBalance = latestTransaction != null
+          ? (latestTransaction['balance'] as num? ?? 0.0).toDouble()
+          : 0.0;
+
+      // Calculate new running credit and balance
+      double runningCredit = previousBalance + credit;
+      double newBalance = runningCredit - paid;
 
       final transactionData = {
         'user_id': selectedUserId!,
         'date': DateTime.now().toIso8601String(),
-        'credit': credit,
+        'credit': credit, // Store transaction-specific credit
         'paid': paid,
-        'balance': credit - paid,
+        'balance': newBalance, // Store new balance
         'mode_of_payment': modeOfPayment,
-        // Uncomment if you add a trays column to wholesale_transaction
-        // 'trays': trays,
       };
 
       if (editingTransactionId != null) {
@@ -264,40 +308,22 @@ class _VipUpdateTransactionScreenState
                 ? 'Transaction updated successfully'
                 : 'Transaction added successfully')),
       );
-    } on PostgrestException catch (e) {
-      String message;
-      if (e.code == '42P01') {
-        message =
-            'Table "wholesale_transaction" does not exist. Verify schema.';
-      } else if (e.code == '42501') {
-        message = 'Permission denied for "wholesale_transaction". Check RLS.';
-      } else {
-        message = 'Error updating transaction: ${e.message} (Code: ${e.code})';
-      }
+    } catch (e) {
       setState(() {
-        errorMessage = message;
+        errorMessage = 'Error updating transaction: $e';
         isLoadingTransactions = false;
       });
       ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text(message)));
-    } catch (e) {
-      setState(() {
-        errorMessage = 'Unexpected error updating transaction: $e';
-        isLoadingTransactions = false;
-      });
-      ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Unexpected error updating transaction: $e')));
+          .showSnackBar(SnackBar(content: Text('Error updating transaction: $e')));
     }
   }
 
   Future<void> _deleteTransaction(String id) async {
-    // Changed from int to String
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Confirm Delete'),
-        content:
-            const Text('Are you sure you want to delete this transaction?'),
+        content: const Text('Are you sure you want to delete this transaction?'),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
@@ -323,41 +349,29 @@ class _VipUpdateTransactionScreenState
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Transaction deleted successfully')),
       );
-    } on PostgrestException catch (e) {
-      String message;
-      if (e.code == '42P01') {
-        message =
-            'Table "wholesale_transaction" does not exist. Verify schema.';
-      } else if (e.code == '42501') {
-        message = 'Permission denied for "wholesale_transaction". Check RLS.';
-      } else {
-        message = 'Error deleting transaction: ${e.message} (Code: ${e.code})';
-      }
+    } catch (e) {
       setState(() {
-        errorMessage = message;
+        errorMessage = 'Error deleting transaction: $e';
         isLoadingTransactions = false;
       });
       ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text(message)));
-    } catch (e) {
-      setState(() {
-        errorMessage = 'Unexpected error deleting transaction: $e';
-        isLoadingTransactions = false;
-      });
-      ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Unexpected error deleting transaction: $e')));
+          .showSnackBar(SnackBar(content: Text('Error deleting transaction: $e')));
     }
   }
 
   void _editTransaction(Map<String, dynamic> transaction) {
     setState(() {
-      editingTransactionId = transaction['id'].toString(); // Ensure string
+      editingTransactionId = transaction['id'].toString();
       selectedUserId = transaction['user_id'].toString();
-      final credit = transaction['credit'] as num;
-      final trays = (credit / (eggRate * 30)).round();
-      _traysController.text = trays.toString();
-      _paidController.text = transaction['paid'].toString();
-      selectedPaymentMode = transaction['mode_of_payment'];
+      final credit = transaction['credit'] as num? ?? 0.0;
+      final trays = credit > 0 ? (credit / (eggRate * 30)).round() : 0;
+      _traysController.text = credit > 0 ? trays.toString() : '';
+      _paidController.text = (transaction['paid'] as num? ?? 0.0) > 0
+          ? transaction['paid'].toString()
+          : '';
+      selectedPaymentMode = (transaction['paid'] as num? ?? 0.0) > 0
+          ? transaction['mode_of_payment']
+          : null;
       _calculateCredit();
     });
   }
@@ -393,6 +407,7 @@ class _VipUpdateTransactionScreenState
 
   @override
   void dispose() {
+    supabase.channel('wholesale_transactions').unsubscribe();
     _traysController.removeListener(_calculateCredit);
     _traysController.dispose();
     _paidController.dispose();
@@ -472,8 +487,7 @@ class _VipUpdateTransactionScreenState
                                 value: selectedUserId,
                                 hint: Text(
                                   'Select User',
-                                  style:
-                                      GoogleFonts.roboto(color: Colors.black54),
+                                  style: GoogleFonts.roboto(color: Colors.black54),
                                 ),
                                 decoration: InputDecoration(
                                   border: OutlineInputBorder(
@@ -505,7 +519,7 @@ class _VipUpdateTransactionScreenState
                                 controller: _traysController,
                                 keyboardType: TextInputType.number,
                                 decoration: InputDecoration(
-                                  labelText: 'Number of Trays',
+                                  labelText: 'Number of Trays (Optional)',
                                   border: OutlineInputBorder(
                                     borderRadius: BorderRadius.circular(12),
                                   ),
@@ -539,7 +553,7 @@ class _VipUpdateTransactionScreenState
                                 controller: _paidController,
                                 keyboardType: TextInputType.number,
                                 decoration: InputDecoration(
-                                  labelText: 'Paid (₹)',
+                                  labelText: 'Paid (₹) (Optional)',
                                   border: OutlineInputBorder(
                                     borderRadius: BorderRadius.circular(12),
                                   ),
@@ -552,9 +566,8 @@ class _VipUpdateTransactionScreenState
                               DropdownButtonFormField<String>(
                                 value: selectedPaymentMode,
                                 hint: Text(
-                                  'Select Payment Mode',
-                                  style:
-                                      GoogleFonts.roboto(color: Colors.black54),
+                                  'Select Payment Mode (Optional)',
+                                  style: GoogleFonts.roboto(color: Colors.black54),
                                 ),
                                 decoration: InputDecoration(
                                   border: OutlineInputBorder(
@@ -591,7 +604,7 @@ class _VipUpdateTransactionScreenState
                                 ),
                               const SizedBox(height: 16),
                               ElevatedButton(
-                                onPressed: isLoadingTransactions
+                                onPressed: isLoadingTransactions || selectedUserId == null
                                     ? null
                                     : _updateTransaction,
                                 style: ElevatedButton.styleFrom(
@@ -599,13 +612,11 @@ class _VipUpdateTransactionScreenState
                                   shape: RoundedRectangleBorder(
                                     borderRadius: BorderRadius.circular(12),
                                   ),
-                                  padding:
-                                      const EdgeInsets.symmetric(vertical: 16),
+                                  padding: const EdgeInsets.symmetric(vertical: 16),
                                   minimumSize: const Size(double.infinity, 50),
                                 ),
                                 child: isLoadingTransactions
-                                    ? const CircularProgressIndicator(
-                                        color: Colors.white)
+                                    ? const CircularProgressIndicator(color: Colors.white)
                                     : Text(
                                         editingTransactionId != null
                                             ? 'Update Transaction'
@@ -651,8 +662,7 @@ class _VipUpdateTransactionScreenState
                               ),
                               const SizedBox(height: 12),
                               Row(
-                                mainAxisAlignment:
-                                    MainAxisAlignment.spaceBetween,
+                                mainAxisAlignment: MainAxisAlignment.spaceBetween,
                                 children: [
                                   Expanded(
                                     child: TextButton.icon(
@@ -675,16 +685,10 @@ class _VipUpdateTransactionScreenState
                                     child: DropdownButton<String>(
                                       value: selectedModeOfPayment ?? 'All',
                                       items: const [
-                                        DropdownMenuItem(
-                                            value: 'All',
-                                            child: Text('All Modes')),
-                                        DropdownMenuItem(
-                                            value: 'Cash', child: Text('Cash')),
-                                        DropdownMenuItem(
-                                            value: 'Online',
-                                            child: Text('Online')),
-                                        DropdownMenuItem(
-                                            value: 'None', child: Text('None')),
+                                        DropdownMenuItem(value: 'All', child: Text('All Modes')),
+                                        DropdownMenuItem(value: 'Cash', child: Text('Cash')),
+                                        DropdownMenuItem(value: 'Online', child: Text('Online')),
+                                        DropdownMenuItem(value: 'None', child: Text('None')),
                                       ],
                                       onChanged: (value) {
                                         setState(() {
@@ -752,8 +756,7 @@ class _VipUpdateTransactionScreenState
                           ? Center(
                               child: CircularProgressIndicator(
                                 color: Colors.white,
-                                valueColor:
-                                    AlwaysStoppedAnimation<Color>(Colors.white),
+                                valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
                               ),
                             )
                           : transactions.isEmpty
@@ -765,10 +768,7 @@ class _VipUpdateTransactionScreenState
                                   child: Container(
                                     decoration: BoxDecoration(
                                       gradient: const LinearGradient(
-                                        colors: [
-                                          Color(0xFFF5F5F5),
-                                          Colors.white
-                                        ],
+                                        colors: [Color(0xFFF5F5F5), Colors.white],
                                         begin: Alignment.topLeft,
                                         end: Alignment.bottomRight,
                                       ),
@@ -803,152 +803,112 @@ class _VipUpdateTransactionScreenState
                                   shrinkWrap: true,
                                   physics: const NeverScrollableScrollPhysics(),
                                   itemCount: transactions.length,
-                                  separatorBuilder: (_, __) =>
-                                      const SizedBox(height: 12),
+                                  separatorBuilder: (_, __) => const SizedBox(height: 12),
                                   itemBuilder: (context, index) {
                                     final transaction = transactions[index];
                                     final userName =
-                                        transaction['wholesale_users']
-                                            ['full_name'];
-                                    final date =
-                                        DateTime.parse(transaction['date']);
+                                        transaction['wholesale_users']['full_name'] ?? 'Unknown';
+                                    final date = DateTime.parse(transaction['date']);
                                     final formattedDate =
-                                        DateFormat('d MMM yyyy, HH:mm')
-                                            .format(date);
-                                    final credit = transaction['credit']
+                                        DateFormat('d MMM yyyy, HH:mm').format(date);
+                                    final credit =
+                                        (transaction['running_credit'] as num? ?? 0.0)
+                                            .toStringAsFixed(2);
+                                    final paid = (transaction['paid'] as num? ?? 0.0)
                                         .toStringAsFixed(2);
-                                    final paid =
-                                        transaction['paid'].toStringAsFixed(2);
-                                    final balance = transaction['balance']
+                                    final balance = (transaction['balance'] as num? ?? 0.0)
                                         .toStringAsFixed(2);
                                     final modeOfPayment =
-                                        transaction['mode_of_payment'] ??
-                                            'None';
-                                    final trays =
-                                        (transaction['credit'] / (eggRate * 30))
-                                            .round();
+                                        transaction['mode_of_payment'] ?? 'None';
+                                    final trays = ((transaction['credit'] as num? ?? 0.0) /
+                                            (eggRate * 30))
+                                        .round();
                                     final initials = userName
                                         .split(' ')
                                         .map((e) => e.isNotEmpty ? e[0] : '')
                                         .take(2)
                                         .join();
                                     final balanceColor =
-                                        (transaction['balance'] as num) > 0
+                                        (transaction['balance'] as num? ?? 0.0) > 0
                                             ? Colors.redAccent
                                             : Colors.green;
 
                                     return AnimatedOpacity(
                                       opacity: 1.0,
-                                      duration:
-                                          const Duration(milliseconds: 300),
+                                      duration: const Duration(milliseconds: 300),
                                       child: Card(
                                         elevation: 4,
                                         shape: RoundedRectangleBorder(
-                                          borderRadius:
-                                              BorderRadius.circular(12),
+                                          borderRadius: BorderRadius.circular(12),
                                         ),
                                         child: Container(
                                           decoration: BoxDecoration(
                                             gradient: const LinearGradient(
-                                              colors: [
-                                                Color(0xFFF5F5F5),
-                                                Colors.white
-                                              ],
+                                              colors: [Color(0xFFF5F5F5), Colors.white],
                                               begin: Alignment.topLeft,
                                               end: Alignment.bottomRight,
                                             ),
-                                            borderRadius:
-                                                BorderRadius.circular(12),
-                                            border: Border.all(
-                                                color: Colors.grey.shade300),
+                                            borderRadius: BorderRadius.circular(12),
+                                            border: Border.all(color: Colors.grey.shade300),
                                           ),
-                                          padding: EdgeInsets.all(
-                                              screenWidth < 400 ? 12 : 16),
+                                          padding:
+                                              EdgeInsets.all(screenWidth < 400 ? 12 : 16),
                                           child: Row(
-                                            crossAxisAlignment:
-                                                CrossAxisAlignment.start,
+                                            crossAxisAlignment: CrossAxisAlignment.start,
                                             children: [
                                               CircleAvatar(
-                                                radius:
-                                                    screenWidth < 400 ? 20 : 24,
-                                                backgroundColor:
-                                                    const Color(0xFF2196F3),
+                                                radius: screenWidth < 400 ? 20 : 24,
+                                                backgroundColor: const Color(0xFF2196F3),
                                                 child: Text(
                                                   initials,
                                                   style: GoogleFonts.roboto(
                                                     color: Colors.white,
                                                     fontWeight: FontWeight.w700,
-                                                    fontSize: screenWidth < 400
-                                                        ? 14
-                                                        : 16,
+                                                    fontSize: screenWidth < 400 ? 14 : 16,
                                                   ),
                                                 ),
                                               ),
                                               const SizedBox(width: 12),
                                               Expanded(
                                                 child: Column(
-                                                  crossAxisAlignment:
-                                                      CrossAxisAlignment.start,
+                                                  crossAxisAlignment: CrossAxisAlignment.start,
                                                   children: [
                                                     Row(
                                                       children: [
                                                         Expanded(
                                                           child: Text(
                                                             userName,
-                                                            style: GoogleFonts
-                                                                .roboto(
+                                                            style: GoogleFonts.roboto(
                                                               fontSize:
-                                                                  screenWidth <
-                                                                          400
-                                                                      ? 14
-                                                                      : 16,
-                                                              fontWeight:
-                                                                  FontWeight
-                                                                      .w700,
-                                                              color: const Color(
-                                                                  0xFF1A0841),
+                                                                  screenWidth < 400 ? 14 : 16,
+                                                              fontWeight: FontWeight.w700,
+                                                              color: const Color(0xFF1A0841),
                                                             ),
-                                                            overflow:
-                                                                TextOverflow
-                                                                    .ellipsis,
+                                                            overflow: TextOverflow.ellipsis,
                                                           ),
                                                         ),
                                                         Chip(
                                                           label: Text(
                                                             modeOfPayment,
-                                                            style: GoogleFonts
-                                                                .roboto(
+                                                            style: GoogleFonts.roboto(
                                                               fontSize: 10,
-                                                              color: Colors
-                                                                  .grey[800],
+                                                              color: Colors.grey[800],
                                                             ),
                                                           ),
                                                           avatar: Icon(
-                                                            modeOfPayment ==
-                                                                    'Cash'
+                                                            modeOfPayment == 'Cash'
                                                                 ? Icons.money
-                                                                : modeOfPayment ==
-                                                                        'Online'
-                                                                    ? Icons
-                                                                        .credit_card
-                                                                    : Icons
-                                                                        .block,
+                                                                : modeOfPayment == 'Online'
+                                                                    ? Icons.credit_card
+                                                                    : Icons.block,
                                                             size: 14,
-                                                            color: Colors
-                                                                .grey[800],
+                                                            color: Colors.grey[800],
                                                           ),
-                                                          backgroundColor:
-                                                              Colors.grey
-                                                                  .shade200,
-                                                          padding:
-                                                              const EdgeInsets
-                                                                  .symmetric(
-                                                                  horizontal:
-                                                                      4),
+                                                          backgroundColor: Colors.grey.shade200,
+                                                          padding: const EdgeInsets.symmetric(
+                                                              horizontal: 4),
                                                           labelPadding:
-                                                              const EdgeInsets
-                                                                  .only(
-                                                                  right: 4),
+                                                              const EdgeInsets.only(right: 4),
                                                         ),
                                                       ],
                                                     ),
@@ -956,62 +916,41 @@ class _VipUpdateTransactionScreenState
                                                     Text(
                                                       'Date: $formattedDate',
                                                       style: GoogleFonts.roboto(
-                                                        fontSize:
-                                                            screenWidth < 400
-                                                                ? 10
-                                                                : 12,
+                                                        fontSize: screenWidth < 400 ? 10 : 12,
                                                         color: Colors.grey[800],
                                                       ),
-                                                      overflow:
-                                                          TextOverflow.ellipsis,
+                                                      overflow: TextOverflow.ellipsis,
                                                     ),
                                                     const SizedBox(height: 4),
                                                     Text(
                                                       'Trays: $trays',
                                                       style: GoogleFonts.roboto(
-                                                        fontSize:
-                                                            screenWidth < 400
-                                                                ? 12
-                                                                : 14,
-                                                        color: const Color(
-                                                            0xFF4CAF50),
-                                                        fontWeight:
-                                                            FontWeight.w600,
+                                                        fontSize: screenWidth < 400 ? 12 : 14,
+                                                        color: const Color(0xFF4CAF50),
+                                                        fontWeight: FontWeight.w600,
                                                       ),
                                                     ),
                                                     Text(
                                                       'Credit: ₹$credit',
                                                       style: GoogleFonts.roboto(
-                                                        fontSize:
-                                                            screenWidth < 400
-                                                                ? 12
-                                                                : 14,
-                                                        color: const Color(
-                                                            0xFF4CAF50),
-                                                        fontWeight:
-                                                            FontWeight.w600,
+                                                        fontSize: screenWidth < 400 ? 12 : 14,
+                                                        color: const Color(0xFF4CAF50),
+                                                        fontWeight: FontWeight.w600,
                                                       ),
                                                     ),
                                                     Text(
                                                       'Paid: ₹$paid',
                                                       style: GoogleFonts.roboto(
-                                                        fontSize:
-                                                            screenWidth < 400
-                                                                ? 12
-                                                                : 14,
+                                                        fontSize: screenWidth < 400 ? 12 : 14,
                                                         color: Colors.grey[800],
                                                       ),
                                                     ),
                                                     Text(
                                                       'Balance: ₹$balance',
                                                       style: GoogleFonts.roboto(
-                                                        fontSize:
-                                                            screenWidth < 400
-                                                                ? 12
-                                                                : 14,
+                                                        fontSize: screenWidth < 400 ? 12 : 14,
                                                         color: balanceColor,
-                                                        fontWeight:
-                                                            FontWeight.w600,
+                                                        fontWeight: FontWeight.w600,
                                                       ),
                                                     ),
                                                   ],
@@ -1025,32 +964,22 @@ class _VipUpdateTransactionScreenState
                                                     child: IconButton(
                                                       icon: Icon(
                                                         Icons.edit,
-                                                        size: screenWidth < 400
-                                                            ? 18
-                                                            : 20,
-                                                        color: const Color(
-                                                            0xFF2196F3),
+                                                        size: screenWidth < 400 ? 18 : 20,
+                                                        color: const Color(0xFF2196F3),
                                                       ),
-                                                      onPressed: () =>
-                                                          _editTransaction(
-                                                              transaction),
+                                                      onPressed: () => _editTransaction(transaction),
                                                     ),
                                                   ),
                                                   Tooltip(
-                                                    message:
-                                                        'Delete Transaction',
+                                                    message: 'Delete Transaction',
                                                     child: IconButton(
                                                       icon: Icon(
                                                         Icons.delete,
-                                                        size: screenWidth < 400
-                                                            ? 18
-                                                            : 20,
+                                                        size: screenWidth < 400 ? 18 : 20,
                                                         color: Colors.red,
                                                       ),
                                                       onPressed: () =>
-                                                          _deleteTransaction(
-                                                              transaction[
-                                                                  'id']),
+                                                          _deleteTransaction(transaction['id']),
                                                     ),
                                                   ),
                                                 ],
